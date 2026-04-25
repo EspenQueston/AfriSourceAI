@@ -23,12 +23,19 @@ Deno.serve(async (req: Request) => {
     })
 
   try {
-    // ── 1. IP Rate limiting (1 req / IP / 24h) ───────────────────────────────
+    // ── 1. Parse request body ─────────────────────────────────────────────────
     const clientIP =
       req.headers.get("x-forwarded-for")?.split(",")[0].trim() ??
       req.headers.get("cf-connecting-ip") ??
       "unknown"
+    const body = await req.json()
+    const { type } = body as { type: "url" | "image"; value?: string; base64?: string; fileName?: string }
 
+    if (type !== "url" && type !== "image") {
+      return json({ error: "type doit être 'url' ou 'image'" }, 400)
+    }
+
+    // ── 2. IP Rate limiting (1 req / IP / 24h) ───────────────────────────────
     try {
       const supabaseAdmin = createClient(
         Deno.env.get("SUPABASE_URL") ?? "",
@@ -42,7 +49,7 @@ Deno.serve(async (req: Request) => {
         .eq("ip", clientIP)
         .gte("created_at", oneDayAgo)
         .limit(1)
-        .single()
+        .maybeSingle()
 
       if (existing) {
         return json({ error: "Limite atteinte : 1 analyse gratuite par IP toutes les 24h. Créez un compte pour continuer." }, 429)
@@ -56,14 +63,6 @@ Deno.serve(async (req: Request) => {
     } catch (_err) {
       // Table may not exist yet — skip rate limiting gracefully
       console.warn("Rate limit table not available, skipping:", _err)
-    }
-
-    // ── 2. Parse request body ─────────────────────────────────────────────────
-    const body = await req.json()
-    const { type } = body as { type: "url" | "image"; value?: string; base64?: string; fileName?: string }
-
-    if (type !== "url" && type !== "image") {
-      return json({ error: "type doit être 'url' ou 'image'" }, 400)
     }
 
     // ── 3. Fetch product data ──────────────────────────────────────────────────

@@ -88,6 +88,7 @@ Deno.serve(async (req: Request) => {
       .single()
 
     if (profileError || !profile) {
+      console.error("analyze_profile_error", { user_id: user.id, profileError })
       return json({ error: "Profile not found" }, 404)
     }
 
@@ -98,15 +99,16 @@ Deno.serve(async (req: Request) => {
 
     // 4. Parse request
     const { productUrl } = await req.json()
+    const resolvedProductUrl = productUrl ? await resolveShortUrl(productUrl) : ''
 
-    if (!productUrl || !isValidUrl(productUrl)) {
+    if (!resolvedProductUrl || !isValidUrl(resolvedProductUrl)) {
       return json({
         error: "URL invalide. Seules Alibaba, 1688, Taobao, Tmall, AliExpress et e.tb.cn sont supportées.",
       }, 400)
     }
 
     // 5. Scrape product data
-    const productData = await scrapeProduct(productUrl)
+    const productData = await scrapeProduct(resolvedProductUrl)
 
     // 6. Analyze with AI
     const aiResult = await analyzeWithAI(productData)
@@ -117,27 +119,62 @@ Deno.serve(async (req: Request) => {
       : "low"
 
     // 7. Save to DB
-    const { data: savedAnalysis, error: insertError } = await supabaseAdmin
+    const analysisPayload = {
+      user_id: user.id,
+      product_url: resolvedProductUrl,
+      product_name: productData.name || null,
+      supplier_name: productData.supplierName || null,
+      price: productData.price || null,
+      moq: productData.moq || null,
+      confidence_score: Math.round(aiResult.analysis.confidenceScore),
+      ai_analysis: aiResult.analysis,
+      raw_product_data: productData,
+      data_source: productData.dataSource,
+      ai_source: aiResult.aiSource,
+      quality_tier: qualityTier,
+      fallback_reason: aiResult.fallbackReason,
+    }
+
+    let savedAnalysis: unknown = null
+
+    const firstInsert = await supabaseAdmin
       .from("analyses")
-      .insert({
+      .insert(analysisPayload)
+      .select()
+      .single()
+
+    if (!firstInsert.error) {
+      savedAnalysis = firstInsert.data
+    } else {
+      // Backward compatibility if new quality columns are not yet migrated
+      const legacyPayload = {
         user_id: user.id,
-        product_url: productUrl,
+        product_url: resolvedProductUrl,
         product_name: productData.name || null,
         supplier_name: productData.supplierName || null,
         price: productData.price || null,
         moq: productData.moq || null,
-        confidence_score: aiResult.analysis.confidenceScore,
+        confidence_score: Math.round(aiResult.analysis.confidenceScore),
         ai_analysis: aiResult.analysis,
         raw_product_data: productData,
-        data_source: productData.dataSource,
-        ai_source: aiResult.aiSource,
-        quality_tier: qualityTier,
-        fallback_reason: aiResult.fallbackReason,
-      })
-      .select()
-      .single()
+      }
 
-    if (insertError) throw insertError
+      const secondInsert = await supabaseAdmin
+        .from("analyses")
+        .insert(legacyPayload)
+        .select()
+        .single()
+
+      if (secondInsert.error) {
+        console.error("analyze_insert_error", {
+          firstInsertError: firstInsert.error,
+          secondInsertError: secondInsert.error,
+        })
+        throw secondInsert.error
+      }
+
+      savedAnalysis = secondInsert.data
+    }
 
     // 8. Decrement credits for free tier
     if (profile.subscription_tier === "free") {
@@ -162,19 +199,23 @@ Deno.serve(async (req: Request) => {
     return json({ success: true, analysis: savedAnalysis })
   } catch (err) {
     const durationMs = Date.now() - startedAt
-    const supabaseAdmin = createClient(
-      getRequiredEnv("SUPABASE_URL"),
-      getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
-    )
-    await logSystemEvent(supabaseAdmin, {
-      event_name: "analyze_request",
-      service: "analyze",
-      status: "error",
-      latency_ms: durationMs,
-      metadata: { error: String(err) },
-    })
+    try {
+      const supabaseAdmin = createClient(
+        getRequiredEnv("SUPABASE_URL"),
+        getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
+      )
+      await logSystemEvent(supabaseAdmin, {
+        event_name: "analyze_request",
+        service: "analyze",
+        status: "error",
+        latency_ms: durationMs,
+        metadata: { error: String(err) },
+      })
+    } catch (_logErr) {
+      // ignore logging errors
+    }
     console.error("Analyze error:", err)
-    return json({ error: "Erreur interne du serveur" }, 500)
+    return json({ error: "Erreur interne du serveur", debug: String(err) }, 500)
   }
 })
 
@@ -261,6 +302,30 @@ function isValidUrl(url: string): boolean {
   } catch {
     return false
   }
+}
+
+async function resolveShortUrl(url: string): Promise<string> {
+  if (!url.includes("e.tb.cn")) return url
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+      },
+      signal: AbortSignal.timeout(8000),
+      redirect: "follow",
+    })
+    const html = await res.text()
+
+    const match = html.match(/var url\s*=\s*'([^']+)'/)
+    if (match?.[1]) {
+      return match[1]
+    }
+  } catch (err) {
+    console.warn("Short URL resolution failed:", err)
+  }
+
+  return url
 }
 
 function detectPlatform(url: string): Platform {
