@@ -334,16 +334,6 @@ supabase functions deploy negotiate
 supabase functions deploy payment
 ```
 
-## GitHub Publishing Checklist
-
-Before pushing:
-
-1. Confirm `.env`, `.env.local`, and `supabase/functions/.env` are ignored.
-2. Confirm `.env.example` and `supabase/functions/.env.example` are committed.
-3. Run `npm run build`.
-4. Review `git status`.
-5. Push to the GitHub repository.
-
 ## License
 
 No license has been selected yet. Add a `LICENSE` file before making this repository public if external reuse is intended.
