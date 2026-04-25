@@ -41,10 +41,18 @@ interface AIAnalysis {
   }
 }
 
+interface AIResultMeta {
+  analysis: AIAnalysis
+  aiSource: "openrouter" | "fallback"
+  fallbackReason: string | null
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders })
   }
+
+  const startedAt = Date.now()
 
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -101,7 +109,12 @@ Deno.serve(async (req: Request) => {
     const productData = await scrapeProduct(productUrl)
 
     // 6. Analyze with AI
-    const analysis = await analyzeWithAI(productData)
+    const aiResult = await analyzeWithAI(productData)
+    const qualityTier = productData.dataSource === "onebound" && aiResult.aiSource === "openrouter"
+      ? "high"
+      : productData.dataSource === "onebound"
+      ? "medium"
+      : "low"
 
     // 7. Save to DB
     const { data: savedAnalysis, error: insertError } = await supabaseAdmin
@@ -113,9 +126,13 @@ Deno.serve(async (req: Request) => {
         supplier_name: productData.supplierName || null,
         price: productData.price || null,
         moq: productData.moq || null,
-        confidence_score: analysis.confidenceScore,
-        ai_analysis: analysis,
+        confidence_score: aiResult.analysis.confidenceScore,
+        ai_analysis: aiResult.analysis,
         raw_product_data: productData,
+        data_source: productData.dataSource,
+        ai_source: aiResult.aiSource,
+        quality_tier: qualityTier,
+        fallback_reason: aiResult.fallbackReason,
       })
       .select()
       .single()
@@ -127,12 +144,58 @@ Deno.serve(async (req: Request) => {
       await consumeFreeAnalysisCredit(supabaseAdmin, user.id, profile)
     }
 
+    const durationMs = Date.now() - startedAt
+    await logSystemEvent(supabaseAdmin, {
+      user_id: user.id,
+      event_name: "analyze_request",
+      service: "analyze",
+      status: "ok",
+      latency_ms: durationMs,
+      source: productData.dataSource,
+      metadata: {
+        ai_source: aiResult.aiSource,
+        quality_tier: qualityTier,
+        fallback_reason: aiResult.fallbackReason,
+      },
+    })
+
     return json({ success: true, analysis: savedAnalysis })
   } catch (err) {
+    const durationMs = Date.now() - startedAt
+    const supabaseAdmin = createClient(
+      getRequiredEnv("SUPABASE_URL"),
+      getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
+    )
+    await logSystemEvent(supabaseAdmin, {
+      event_name: "analyze_request",
+      service: "analyze",
+      status: "error",
+      latency_ms: durationMs,
+      metadata: { error: String(err) },
+    })
     console.error("Analyze error:", err)
     return json({ error: "Erreur interne du serveur" }, 500)
   }
 })
+
+interface SystemEventInput {
+  user_id?: string
+  event_name: string
+  service: string
+  status: "ok" | "warn" | "error"
+  latency_ms?: number
+  source?: string
+  metadata?: Record<string, unknown>
+}
+
+// deno-lint-ignore no-explicit-any
+async function logSystemEvent(supabaseAdmin: any, input: SystemEventInput) {
+  try {
+    await supabaseAdmin.from("system_events").insert(input)
+  } catch (_err) {
+    // non-blocking logging
+  }
+}
 
 function getRequiredEnv(name: string) {
   const value = Deno.env.get(name)
@@ -352,11 +415,15 @@ function seededNumber(input: string) {
   return hash
 }
 
-async function analyzeWithAI(productData: ProductData): Promise<AIAnalysis> {
+async function analyzeWithAI(productData: ProductData): Promise<AIResultMeta> {
   const openrouterKey = Deno.env.get("OPENROUTER_API_KEY")
 
   if (!openrouterKey) {
-    return getMockAnalysis(productData)
+    return {
+      analysis: getMockAnalysis(productData),
+      aiSource: "fallback",
+      fallbackReason: "openrouter_key_missing",
+    }
   }
 
   const prompt = `
@@ -428,7 +495,11 @@ Réponds UNIQUEMENT avec un objet JSON valide :
     if (!response.ok) {
       const errText = await response.text().catch(() => "")
       console.warn(`OpenRouter API error ${response.status}:`, errText.slice(0, 200))
-      return getMockAnalysis(productData)
+      return {
+        analysis: getMockAnalysis(productData),
+        aiSource: "fallback",
+        fallbackReason: `openrouter_http_${response.status}`,
+      }
     }
 
     const data = await response.json()
@@ -437,13 +508,25 @@ Réponds UNIQUEMENT avec un objet JSON valide :
 
     if (!parsed) {
       console.warn("AI JSON parse failed, using fallback:", content.slice(0, 300))
-      return getMockAnalysis(productData)
+      return {
+        analysis: getMockAnalysis(productData),
+        aiSource: "fallback",
+        fallbackReason: "openrouter_invalid_json",
+      }
     }
 
-    return normalizeAnalysis(parsed, productData)
+    return {
+      analysis: normalizeAnalysis(parsed, productData),
+      aiSource: "openrouter",
+      fallbackReason: null,
+    }
   } catch (err) {
     console.warn("AI analysis failed, using fallback:", err)
-    return getMockAnalysis(productData)
+    return {
+      analysis: getMockAnalysis(productData),
+      aiSource: "fallback",
+      fallbackReason: "openrouter_exception",
+    }
   }
 }
 

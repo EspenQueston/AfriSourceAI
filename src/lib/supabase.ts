@@ -131,6 +131,21 @@ export type Database = {
           created_at: string
         }
       }
+      system_events: {
+        Row: {
+          id: string
+          user_id: string | null
+          event_name: string
+          service: string
+          status: 'ok' | 'warn' | 'error'
+          latency_ms: number | null
+          source: string | null
+          metadata: Record<string, unknown> | null
+          created_at: string
+        }
+        Insert: Omit<SystemEvent, 'id' | 'created_at'>
+        Update: Partial<Omit<SystemEvent, 'id' | 'created_at'>>
+      }
       promo_codes: {
         Row: {
           id: string
@@ -168,6 +183,10 @@ export type Database = {
           confidence_score: number | null
           ai_analysis: AIAnalysisResult | null
           raw_product_data: ProductData | null
+          data_source: string | null
+          ai_source: string | null
+          quality_tier: string | null
+          fallback_reason: string | null
           created_at: string
         }
       }
@@ -316,6 +335,18 @@ export interface UsageLog {
   source: 'subscription' | 'payg'
   feature: string | null
   response_time_ms: number | null
+  created_at: string
+}
+
+export interface SystemEvent {
+  id: string
+  user_id: string | null
+  event_name: string
+  service: string
+  status: 'ok' | 'warn' | 'error'
+  latency_ms: number | null
+  source: string | null
+  metadata: Record<string, unknown> | null
   created_at: string
 }
 

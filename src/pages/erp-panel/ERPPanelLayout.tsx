@@ -18,6 +18,7 @@ const NAV_SECTIONS = [
     items: [
       { icon: LayoutDashboard, label: "Vue d'ensemble",   to: '/erp-panel',              end: true },
       { icon: BarChart3,       label: 'Analytiques',       to: '/erp-panel/analytics'           },
+      { icon: BarChart3,       label: 'Qualité IA',        to: '/erp-panel/ai-quality'          },
     ],
   },
   {

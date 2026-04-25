@@ -551,17 +551,22 @@ export async function getAdminStats() {
   const now = new Date()
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
 
-  const [txRes, subRes, usageRes] = await Promise.all([
+  const [txRes, subRes, usageRes, eventsRes, analysesRes] = await Promise.all([
     supabase.from('payment_transactions').select('amount_usd, status, created_at'),
     supabase.from('subscriptions').select('status, plan_id, created_at'),
     supabase.from('usage_logs').select('request_type, source, created_at').gte('created_at', startOfMonth),
+    supabase.from('system_events').select('status, service, latency_ms, created_at').gte('created_at', startOfMonth),
+    supabase.from('analyses').select('data_source, ai_source, quality_tier, created_at').gte('created_at', startOfMonth),
   ])
 
   if (txRes.error) throw txRes.error
   if (subRes.error) throw subRes.error
   if (usageRes.error) throw usageRes.error
+  if (eventsRes.error) throw eventsRes.error
+  if (analysesRes.error) throw analysesRes.error
 
   const successTx = (txRes.data ?? []).filter(t => t.status === 'success')
+  const failedTx = (txRes.data ?? []).filter(t => t.status === 'failed')
   const mrr = successTx
     .filter(t => new Date(t.created_at) >= new Date(startOfMonth))
     .reduce((sum, t) => sum + (t.amount_usd ?? 0), 0)
@@ -572,7 +577,39 @@ export async function getAdminStats() {
   const basicRequests = (usageRes.data ?? []).filter(u => u.request_type === 'basic').length
   const advancedRequests = (usageRes.data ?? []).filter(u => u.request_type === 'advanced').length
 
-  return { mrr, totalRevenue, activeSubs, totalRequests, basicRequests, advancedRequests }
+  const totalPayments = (txRes.data ?? []).length
+  const paymentFailureRate = totalPayments > 0 ? Number(((failedTx.length / totalPayments) * 100).toFixed(2)) : 0
+
+  const events = eventsRes.data ?? []
+  const errorEvents = events.filter(e => e.status === 'error')
+  const serverErrorRate = events.length > 0 ? Number(((errorEvents.length / events.length) * 100).toFixed(2)) : 0
+  const avgLatencyMs = events.length > 0
+    ? Math.round(events.reduce((sum, e) => sum + (e.latency_ms ?? 0), 0) / events.length)
+    : 0
+
+  const analyses = analysesRes.data ?? []
+  const fallbackAnalyses = analyses.filter(a => a.data_source === 'fallback' || a.ai_source === 'fallback')
+  const fallbackRate = analyses.length > 0 ? Number(((fallbackAnalyses.length / analyses.length) * 100).toFixed(2)) : 0
+
+  const highSeverityAlerts = [
+    paymentFailureRate >= 20 ? `Taux d'échec paiement élevé (${paymentFailureRate}%)` : null,
+    serverErrorRate >= 10 ? `Taux d'erreurs serveur élevé (${serverErrorRate}%)` : null,
+    fallbackRate >= 40 ? `Taux fallback IA élevé (${fallbackRate}%)` : null,
+  ].filter(Boolean) as string[]
+
+  return {
+    mrr,
+    totalRevenue,
+    activeSubs,
+    totalRequests,
+    basicRequests,
+    advancedRequests,
+    paymentFailureRate,
+    serverErrorRate,
+    avgLatencyMs,
+    fallbackRate,
+    highSeverityAlerts,
+  }
 }
 
 

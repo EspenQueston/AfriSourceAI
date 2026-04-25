@@ -33,6 +33,7 @@ import AdminUsers from '@/pages/admin/AdminUsers'
 import AdminPromoCodes from '@/pages/admin/AdminPromoCodes'
 import AdminWebhooks from '@/pages/admin/AdminWebhooks'
 import AdminAnalytics from '@/pages/admin/AdminAnalytics'
+import AdminAIQuality from '@/pages/admin/AdminAIQuality'
 
 // Re-use existing ERP pages
 import ClientsPage from '@/pages/erp/Clients'
@@ -58,6 +59,28 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   return user ? <>{children}</> : <Navigate to="/login" replace />
 }
 
+function AdminRoute({ children }: { children: React.ReactNode }) {
+  const { user, profile, loading } = useAuth()
+  const [timedOut, setTimedOut] = useState(false)
+
+  useEffect(() => {
+    if (!loading) return
+    const timer = setTimeout(() => setTimedOut(true), 8000)
+    return () => clearTimeout(timer)
+  }, [loading])
+
+  if (loading && !timedOut) return (
+    <div className="min-h-screen bg-background flex items-center justify-center">
+      <div className="h-8 w-8 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+    </div>
+  )
+
+  if (!user) return <Navigate to="/login" replace />
+  if (!profile?.is_admin) return <Navigate to="/dashboard" replace />
+
+  return <>{children}</>
+}
+
 function AppRoutes() {
   return (
     <Routes>
@@ -80,7 +103,7 @@ function AppRoutes() {
         <Route path="/dashboard/pricing" element={<DashboardPricingPage />} />
       </Route>
       {/* Unified ERP Panel — Admin + ERP + Users */}
-      <Route path="/erp-panel" element={<ERPPanelLayout />}>
+      <Route path="/erp-panel" element={<AdminRoute><ERPPanelLayout /></AdminRoute>}>
         <Route index element={<ERPPanelDashboard />} />
         <Route path="plans" element={<AdminPlans />} />
         <Route path="transactions" element={<AdminTransactions />} />
@@ -88,6 +111,7 @@ function AppRoutes() {
         <Route path="promo" element={<AdminPromoCodes />} />
         <Route path="webhooks" element={<AdminWebhooks />} />
         <Route path="analytics" element={<AdminAnalytics />} />
+        <Route path="ai-quality" element={<AdminAIQuality />} />
         <Route path="clients" element={<ClientsPage />} />
         <Route path="orders" element={<OrdersPage />} />
         <Route path="delivery" element={<DeliveryPage />} />

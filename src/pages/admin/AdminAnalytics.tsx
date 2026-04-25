@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { BarChart3, TrendingUp, Users, Zap, Loader2 } from 'lucide-react'
+import { AlertTriangle, BarChart3, TrendingUp, Users, Zap, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { getAdminStats } from '@/lib/db'
 import { supabase } from '@/lib/supabase'
@@ -52,6 +52,7 @@ export default function AdminAnalytics() {
   }
 
   const maxRevenue = Math.max(...monthlyRevenue.map(r => r.amount), 1)
+  const alerts = stats?.highSeverityAlerts ?? []
 
   return (
     <div className="space-y-6">
@@ -92,6 +93,43 @@ export default function AdminAnalytics() {
           </CardContent>
         </Card>
       </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <Card>
+          <CardContent className="p-5">
+            <p className="text-sm text-muted-foreground">Taux fallback IA</p>
+            <p className="text-2xl font-bold mt-2">{stats?.fallbackRate ?? 0}%</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-5">
+            <p className="text-sm text-muted-foreground">Échec paiements</p>
+            <p className="text-2xl font-bold mt-2">{stats?.paymentFailureRate ?? 0}%</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-5">
+            <p className="text-sm text-muted-foreground">Latence moyenne</p>
+            <p className="text-2xl font-bold mt-2">{stats?.avgLatencyMs ?? 0} ms</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {alerts.length > 0 && (
+        <Card className="border-amber-300 bg-amber-50/50 dark:bg-amber-900/20">
+          <CardHeader>
+            <CardTitle className="text-base flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-amber-600" />
+              Alertes opérationnelles
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {alerts.map((alert) => (
+              <p key={alert} className="text-sm text-amber-700 dark:text-amber-300">• {alert}</p>
+            ))}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Revenue Chart (simple bar) */}
       <Card>

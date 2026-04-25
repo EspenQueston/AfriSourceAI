@@ -94,6 +94,33 @@ STRIPE_SECRET_KEY=your-stripe-secret-key
 
 Never commit real `.env` files. They are intentionally ignored by git.
 
+## Environment Process (Dev / Staging / Prod)
+
+- **Development**
+  - Frontend uses `.env` from `.env.example`.
+  - Local Supabase function secrets can be loaded from `supabase/functions/.env`.
+  - Use sandbox payment credentials only.
+
+- **Staging**
+  - Use a dedicated Supabase project and separate payment sandbox keys.
+  - Deploy via `supabase db push` + functions deploy to staging.
+  - Validate full checkout flow before production release.
+
+- **Production**
+  - Secrets configured only in Supabase project settings / secure CI variables.
+  - No secret files committed in repository.
+  - Production keys never reused in development or staging.
+
+### Pre-release Configuration Checklist
+
+- [ ] `VITE_SUPABASE_URL` points to correct environment project
+- [ ] `VITE_SUPABASE_ANON_KEY` is valid and not disabled
+- [ ] Payment function secrets set (`CINETPAY_*`, `FEDAPAY_API_KEY`, `STRIPE_SECRET_KEY`)
+- [ ] `SUPABASE_SERVICE_ROLE_KEY` only configured server-side
+- [ ] No `.env.local` or `supabase/functions/.env` tracked in git
+- [ ] Migrations applied to target environment
+- [ ] Payment methods marked active in `payment_methods.json` match deployed provider credentials
+
 ## Local Development
 
 Install dependencies:
@@ -118,6 +145,12 @@ Run TypeScript checks only:
 
 ```bash
 npm run typecheck
+```
+
+Run credit RPC validation (requires `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `TEST_USER_ID`):
+
+```bash
+npm run test:credits
 ```
 
 Preview the production build:
@@ -190,6 +223,12 @@ Protected endpoint that creates a negotiation strategy for a saved analysis.
 
 Protected endpoint that keeps payment gateway credentials server-side. Browser code calls this function with the signed-in user's access token.
 
+Observability and quality notes:
+
+- `analyze` and `payment` emit structured operational events into `system_events` (status, service, latency, source, metadata).
+- `analyses` stores `data_source`, `ai_source`, `quality_tier`, and `fallback_reason` to monitor Onebound/OpenRouter fallback quality.
+- Admin panel includes IA quality view at `/erp-panel/ai-quality` for fallback case tracking.
+
 Supported provider abstractions:
 
 - CinetPay
@@ -245,7 +284,11 @@ Important RPC helpers:
 - `consume_advanced_credit`
 - `get_credit_balance`
 
-The app still includes `credits_remaining` as a legacy compatibility field, while newer screens primarily use `basic_credits_remaining`, `advanced_credits_remaining`, `payg_basic_credits`, and `payg_advanced_credits`.
+Credit source of truth (official):
+
+- **V2 model is authoritative**: `basic_credits_remaining`, `advanced_credits_remaining`, `payg_basic_credits`, `payg_advanced_credits`.
+- `credits_remaining` is now **legacy/deprecated compatibility only** and synchronized from V2 for safe rollback windows.
+- Migration `20260425_credit_observability_quality.sql` sets `credit_model_version = 'v2'` and keeps legacy sync during transition.
 
 ## Pricing Plans
 
