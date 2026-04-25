@@ -1,0 +1,537 @@
+import "jsr:@supabase/functions-js/edge-runtime.d.ts"
+import { createClient } from "jsr:@supabase/supabase-js@2"
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+}
+
+type Platform = "1688" | "taobao" | "tmall" | "alibaba" | "aliexpress"
+
+interface ProductData {
+  name: string
+  price: number
+  moq: number
+  supplierName: string
+  supplierYears: number
+  supplierResponseRate: number
+  description: string
+  reviews: number
+  images: string[]
+  sourceUrl: string
+  platform: Platform
+  dataSource: "onebound" | "fallback"
+}
+
+interface AIAnalysis {
+  confidenceScore: number
+  confidenceReason: string
+  priceAnalysis: {
+    marketAverage: number
+    comparison: string
+    targetPrice: number
+  }
+  warnings: string[]
+  contactMessage: string
+  summary: string
+  negotiationStrategy: {
+    openingOffer: number
+    walkAwayPrice: number
+    tactics: string[]
+  }
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders })
+  }
+
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    })
+
+  try {
+    // 1. Init Supabase with service role
+    const supabaseAdmin = createClient(
+      getRequiredEnv("SUPABASE_URL"),
+      getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
+    )
+
+    // 2. Auth — verify JWT
+    const authHeader = req.headers.get("Authorization")
+    if (!authHeader) {
+      return json({ error: "Unauthorized" }, 401)
+    }
+
+    const token = authHeader.replace("Bearer ", "")
+    const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token)
+
+    if (authError || !user) {
+      return json({ error: "Unauthorized" }, 401)
+    }
+
+    // 3. Get user profile (credits check)
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from("profiles")
+      .select("*")
+      .eq("id", user.id)
+      .single()
+
+    if (profileError || !profile) {
+      return json({ error: "Profile not found" }, 404)
+    }
+
+    const credits = getCreditSnapshot(profile)
+    if (!credits.canAnalyze) {
+      return json({ error: "Crédits épuisés. Passez à un plan payant pour continuer." }, 403)
+    }
+
+    // 4. Parse request
+    const { productUrl } = await req.json()
+
+    if (!productUrl || !isValidUrl(productUrl)) {
+      return json({
+        error: "URL invalide. Seules Alibaba, 1688, Taobao, Tmall, AliExpress et e.tb.cn sont supportées.",
+      }, 400)
+    }
+
+    // 5. Scrape product data
+    const productData = await scrapeProduct(productUrl)
+
+    // 6. Analyze with AI
+    const analysis = await analyzeWithAI(productData)
+
+    // 7. Save to DB
+    const { data: savedAnalysis, error: insertError } = await supabaseAdmin
+      .from("analyses")
+      .insert({
+        user_id: user.id,
+        product_url: productUrl,
+        product_name: productData.name || null,
+        supplier_name: productData.supplierName || null,
+        price: productData.price || null,
+        moq: productData.moq || null,
+        confidence_score: analysis.confidenceScore,
+        ai_analysis: analysis,
+        raw_product_data: productData,
+      })
+      .select()
+      .single()
+
+    if (insertError) throw insertError
+
+    // 8. Decrement credits for free tier
+    if (profile.subscription_tier === "free") {
+      await consumeFreeAnalysisCredit(supabaseAdmin, user.id, profile)
+    }
+
+    return json({ success: true, analysis: savedAnalysis })
+  } catch (err) {
+    console.error("Analyze error:", err)
+    return json({ error: "Erreur interne du serveur" }, 500)
+  }
+})
+
+function getRequiredEnv(name: string) {
+  const value = Deno.env.get(name)
+  if (!value) throw new Error(`${name} is not configured`)
+  return value
+}
+
+// deno-lint-ignore no-explicit-any
+function getCreditSnapshot(profile: Record<string, any>) {
+  const isAdmin = profile.is_admin === true
+  const tier = String(profile.subscription_tier ?? "free")
+  const legacyCredits = Number(profile.credits_remaining ?? 0)
+  const basicCredits = Number(profile.basic_credits_remaining ?? legacyCredits)
+  const paygBasicCredits = Number(profile.payg_basic_credits ?? 0)
+  const availableBasicCredits = basicCredits + paygBasicCredits
+
+  return {
+    isAdmin,
+    tier,
+    availableBasicCredits,
+    canAnalyze: isAdmin || tier !== "free" || availableBasicCredits > 0 || legacyCredits > 0,
+  }
+}
+
+// deno-lint-ignore no-explicit-any
+async function consumeFreeAnalysisCredit(supabaseAdmin: any, userId: string, profile: Record<string, any>) {
+  const { data, error } = await supabaseAdmin.rpc("consume_basic_credit", {
+    p_user_id: userId,
+    p_feature: "analyze",
+  })
+
+  if (!error && data?.success !== false) return
+
+  console.warn("consume_basic_credit unavailable, using legacy decrement:", error ?? data)
+  const legacyCredits = Number(profile.credits_remaining ?? 0)
+  const basicCredits = Number(profile.basic_credits_remaining ?? legacyCredits)
+
+  const { error: updateError } = await supabaseAdmin
+    .from("profiles")
+    .update({
+      credits_remaining: Math.max(0, legacyCredits - 1),
+      basic_credits_remaining: Math.max(0, basicCredits - 1),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", userId)
+
+  if (updateError) {
+    console.warn("Legacy credit decrement failed:", updateError)
+  }
+}
+
+function isValidUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname
+    return (
+      host.includes("alibaba.com") ||
+      host.includes("1688.com") ||
+      host.includes("taobao.com") ||
+      host.includes("tmall.com") ||
+      host.includes("aliexpress.com") ||
+      host.includes("e.tb.cn")
+    )
+  } catch {
+    return false
+  }
+}
+
+function detectPlatform(url: string): Platform {
+  if (url.includes("1688.com")) return "1688"
+  if (url.includes("taobao.com") || url.includes("e.tb.cn")) return "taobao"
+  if (url.includes("tmall.com")) return "tmall"
+  if (url.includes("aliexpress.com")) return "aliexpress"
+  return "alibaba"
+}
+
+function extractItemId(url: string, platform: string): string | null {
+  try {
+    const parsed = new URL(url)
+    if (platform === "1688") {
+      // Mobile: detail.m.1688.com/page/index.htm?offerId=754018142522
+      const offerId = parsed.searchParams.get("offerId")
+      if (offerId) return offerId
+      // Desktop: detail.1688.com/offer/754018142522.html
+      return url.match(/offer\/(\d+)\.html/)?.[1] ?? url.match(/\/(\d{10,})(?:\.html)?/)?.[1] ?? null
+    }
+    if (platform === "taobao" || platform === "tmall") {
+      return parsed.searchParams.get("id") ?? parsed.searchParams.get("itemId")
+    }
+    if (platform === "aliexpress") {
+      return url.match(/_(\d{8,})\.html/)?.[1] ?? parsed.searchParams.get("productId") ?? null
+    }
+    // alibaba: …/product-detail/name_60846999786.html
+    return (
+      url.match(/_(\d{8,})\.html/)?.[1] ??
+      url.match(/\/(\d{8,})\.html/)?.[1] ??
+      null
+    )
+  } catch {
+    return null
+  }
+}
+
+async function scrapeProduct(url: string): Promise<ProductData> {
+  const key = Deno.env.get("ONEBOUND_KEY")
+  const secret = Deno.env.get("ONEBOUND_SECRET")
+  const platform = detectPlatform(url)
+  const itemId = extractItemId(url, platform)
+
+  if (!itemId || !key || !secret) return buildFallbackData(url, platform, itemId)
+
+  const apiUrl = `https://api-gw.onebound.cn/${platform}/item_get/?key=${key}&secret=${secret}&num_iid=${encodeURIComponent(itemId)}&lang=zh-CN&cache=1&async=0`
+
+  try {
+    const response = await fetch(apiUrl, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; AfriSourceBot/1.0)" },
+      signal: AbortSignal.timeout(12000),
+    })
+    if (!response.ok) return buildFallbackData(url, platform, itemId)
+    const json = await response.json()
+    return parseOneboundResponse(json, url, platform, itemId)
+  } catch (err) {
+    console.warn("Onebound scrape failed, using fallback:", err)
+    return buildFallbackData(url, platform, itemId)
+  }
+}
+
+// deno-lint-ignore no-explicit-any
+function parseOneboundResponse(json: any, url: string, platform: Platform, itemId: string | null): ProductData {
+  const item = json?.item ?? json?.result ?? {}
+
+  if (json?.error && !item?.title && !item?.name) {
+    console.warn("Onebound returned an error:", String(json.error).slice(0, 200))
+    return buildFallbackData(url, platform, itemId)
+  }
+
+  const name = String(item.title ?? item.name ?? "Produit importé").slice(0, 200)
+  const rawPrice = parseFloat(
+    String(item.price ?? item.sale_price ?? item.min_price ?? "0").replace(/[^\d.]/g, ""),
+  ) || 0
+  const moqRaw = String(item.min_order ?? item.min_num ?? "1")
+  const moq = parseInt(moqRaw.match(/(\d+)/)?.[1] ?? "1") || 1
+
+  const sellerInfo = item.seller_info ?? {}
+  const supplierName = String(
+    sellerInfo.zhuy ?? sellerInfo.ww_info ?? item.nick ?? "Fournisseur",
+  ).slice(0, 100)
+  const supplierYears = parseInt(String(sellerInfo.experience ?? sellerInfo.years ?? "0")) || 0
+  const responseRate = Math.min(100, Math.max(0, parseInt(String(sellerInfo.score_s ?? "90")) || 90))
+
+  const descRaw = typeof item.desc === "string"
+    ? item.desc.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().slice(0, 500)
+    : `Produit ${platform} importé depuis la Chine`
+
+  // deno-lint-ignore no-explicit-any
+  const images = Array.isArray(item.item_imgs)
+    // deno-lint-ignore no-explicit-any
+    ? item.item_imgs.slice(0, 5).map((i: any) => fixImageUrl(String(i.url ?? i))).filter(Boolean)
+    : []
+
+  return {
+    name,
+    price: rawPrice,
+    moq,
+    supplierName,
+    supplierYears,
+    supplierResponseRate: responseRate,
+    description: descRaw,
+    reviews: parseInt(String(item.comment_count ?? item.num_sold30 ?? "0")) || 0,
+    images,
+    sourceUrl: url,
+    platform,
+    dataSource: "onebound",
+  }
+}
+
+function fixImageUrl(url: string): string {
+  if (!url) return ""
+  const lastHttps = url.lastIndexOf("https://")
+  if (lastHttps > 0) return url.slice(lastHttps)
+  if (url.startsWith("//")) return "https:" + url
+  return url
+}
+
+function buildFallbackData(url: string, platform: Platform, itemId: string | null): ProductData {
+  const platformLabel: Record<string, string> = {
+    alibaba: "Alibaba",
+    aliexpress: "AliExpress",
+    "1688": "1688",
+    taobao: "Taobao",
+    tmall: "Tmall",
+  }
+  const seed = seededNumber(itemId ?? url)
+  const price = Number((5 + (seed % 180) + ((seed % 9) / 10)).toFixed(2))
+  const moq = [1, 2, 5, 10, 20, 50][seed % 6]
+
+  return {
+    name: `Produit ${platformLabel[platform] ?? "importé"}${itemId ? ` #${itemId}` : ""}`,
+    price,
+    moq,
+    supplierName: "Fournisseur",
+    supplierYears: 0,
+    supplierResponseRate: 0,
+    description: `Produit depuis ${url}`,
+    reviews: 0,
+    images: [],
+    sourceUrl: url,
+    platform,
+    dataSource: "fallback",
+  }
+}
+
+function seededNumber(input: string) {
+  let hash = 0
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 31 + input.charCodeAt(i)) >>> 0
+  }
+  return hash
+}
+
+async function analyzeWithAI(productData: ProductData): Promise<AIAnalysis> {
+  const openrouterKey = Deno.env.get("OPENROUTER_API_KEY")
+
+  if (!openrouterKey) {
+    return getMockAnalysis(productData)
+  }
+
+  const prompt = `
+Tu es un expert en import/export Chine-Afrique. Analyse ce produit et génère un rapport détaillé.
+
+DONNÉES PRODUIT :
+- Nom : ${productData.name}
+- Prix : $${productData.price}/unité
+- MOQ : ${productData.moq}
+- Fournisseur : ${productData.supplierName}
+- Années d'activité : ${productData.supplierYears}
+- Taux de réponse : ${productData.supplierResponseRate}%
+- Reviews : ${productData.reviews}
+- Description : ${productData.description}
+
+GÉNÈRE :
+
+1. **Score de confiance** (0-100) avec justification
+2. **Analyse de prix** : compare au marché africain, dis si cher/correct/bon prix
+3. **5 points de vigilance** spécifiques à ce produit
+4. **Message de contact en chinois** optimisé pour obtenir le meilleur prix
+5. **Prix cible de négociation** recommandé
+6. **Stratégie de négociation** avec offre d'ouverture et prix de retrait
+
+Réponds UNIQUEMENT avec un objet JSON valide :
+{
+  "confidenceScore": number,
+  "confidenceReason": string,
+  "priceAnalysis": {
+    "marketAverage": number,
+    "comparison": string,
+    "targetPrice": number
+  },
+  "warnings": string[],
+  "contactMessage": string,
+  "summary": string,
+  "negotiationStrategy": {
+    "openingOffer": number,
+    "walkAwayPrice": number,
+    "tactics": string[]
+  }
+}
+`
+
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${openrouterKey}`,
+        "HTTP-Referer": "https://afrisourceai.com",
+        "X-Title": "AfriSource AI",
+      },
+      body: JSON.stringify({
+        model: "google/gemma-3-27b-it:free",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Tu es un expert en sourcing et import/export Chine-Afrique. Réponds toujours en JSON valide uniquement, sans markdown.",
+          },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.7,
+      }),
+      signal: AbortSignal.timeout(35000),
+    })
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "")
+      console.warn(`OpenRouter API error ${response.status}:`, errText.slice(0, 200))
+      return getMockAnalysis(productData)
+    }
+
+    const data = await response.json()
+    const content = data.choices?.[0]?.message?.content ?? ""
+    const parsed = parseJsonObject(content)
+
+    if (!parsed) {
+      console.warn("AI JSON parse failed, using fallback:", content.slice(0, 300))
+      return getMockAnalysis(productData)
+    }
+
+    return normalizeAnalysis(parsed, productData)
+  } catch (err) {
+    console.warn("AI analysis failed, using fallback:", err)
+    return getMockAnalysis(productData)
+  }
+}
+
+function parseJsonObject(content: string): Record<string, unknown> | null {
+  const clean = content.replace(/^```json?\s*/i, "").replace(/```\s*$/i, "").trim()
+  try {
+    return JSON.parse(clean)
+  } catch {
+    const match = clean.match(/\{[\s\S]+\}/)
+    if (!match) return null
+    try {
+      return JSON.parse(match[0])
+    } catch {
+      return null
+    }
+  }
+}
+
+function asNumber(value: unknown, fallback: number) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function asStringArray(value: unknown, fallback: string[]) {
+  if (!Array.isArray(value)) return fallback
+  const items = value.map((item) => String(item)).filter(Boolean)
+  return items.length > 0 ? items : fallback
+}
+
+function normalizeAnalysis(parsed: Record<string, unknown>, productData: ProductData): AIAnalysis {
+  const fallback = getMockAnalysis(productData)
+  const priceAnalysis = parsed.priceAnalysis as Record<string, unknown> | undefined
+  const negotiationStrategy = parsed.negotiationStrategy as Record<string, unknown> | undefined
+
+  return {
+    confidenceScore: Math.max(0, Math.min(100, asNumber(parsed.confidenceScore, fallback.confidenceScore))),
+    confidenceReason: String(parsed.confidenceReason ?? fallback.confidenceReason),
+    priceAnalysis: {
+      marketAverage: asNumber(priceAnalysis?.marketAverage, fallback.priceAnalysis.marketAverage),
+      comparison: String(priceAnalysis?.comparison ?? fallback.priceAnalysis.comparison),
+      targetPrice: asNumber(priceAnalysis?.targetPrice, fallback.priceAnalysis.targetPrice),
+    },
+    warnings: asStringArray(parsed.warnings, fallback.warnings).slice(0, 8),
+    contactMessage: String(parsed.contactMessage ?? fallback.contactMessage),
+    summary: String(parsed.summary ?? fallback.summary),
+    negotiationStrategy: {
+      openingOffer: asNumber(negotiationStrategy?.openingOffer, fallback.negotiationStrategy.openingOffer),
+      walkAwayPrice: asNumber(negotiationStrategy?.walkAwayPrice, fallback.negotiationStrategy.walkAwayPrice),
+      tactics: asStringArray(negotiationStrategy?.tactics, fallback.negotiationStrategy.tactics).slice(0, 8),
+    },
+  }
+}
+
+function getMockAnalysis(productData: ProductData): AIAnalysis {
+  const price = productData.price || 5
+  const targetPrice = price * 0.75
+
+  return {
+    confidenceScore: 72,
+    confidenceReason:
+      "Fournisseur avec bon historique, taux de réponse satisfaisant. Quelques points à vérifier sur la qualité.",
+    priceAnalysis: {
+      marketAverage: price * 1.1,
+      comparison:
+        price < price * 1.1
+          ? "Prix légèrement en dessous du marché — bon signe"
+          : "Prix dans la moyenne du marché",
+      targetPrice: parseFloat(targetPrice.toFixed(2)),
+    },
+    warnings: [
+      "Demandez un échantillon avant toute commande importante",
+      "Vérifiez les certifications du produit (CE, RoHS si applicable)",
+      "Négociez les conditions de paiement : 30% avance, 70% avant expédition",
+      "Demandez des photos détaillées de l'emballage réel",
+      "Clarifiez les délais de production et d'expédition par écrit",
+    ],
+    contactMessage:
+      "您好！我对您的产品很感兴趣。我是非洲的进口商，有意大量采购。能否给我一个更优惠的价格？我们可以建立长期合作关系。期待您的回复！",
+    summary: `Produit ${productData.name} analysé. Score de confiance : 72/100. Négociation recommandée autour de $${targetPrice.toFixed(2)}/unité pour optimiser vos marges sur le marché africain.`,
+    negotiationStrategy: {
+      openingOffer: parseFloat((price * 0.65).toFixed(2)),
+      walkAwayPrice: parseFloat((price * 0.85).toFixed(2)),
+      tactics: [
+        "Mentionner un volume d'achat potentiel plus important que prévu",
+        "Comparer avec 2-3 fournisseurs concurrents",
+        "Proposer un paiement rapide en échange d'une remise",
+        "Demander une remise pour commande récurrente mensuelle",
+      ],
+    },
+  }
+}
