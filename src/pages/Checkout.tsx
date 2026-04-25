@@ -11,7 +11,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ModeToggle } from '@/components/mode-toggle'
 import { useAuth } from '@/contexts/AuthContext'
-import { getPlans, createTransaction, getExchangeRates } from '@/lib/db'
+import { getPlans, createTransaction, getExchangeRates, updateTransaction } from '@/lib/db'
 import { CinetPayProvider } from '@/lib/payment/providers/CinetPay'
 import { FedaPayProvider } from '@/lib/payment/providers/FedaPay'
 import { StripeProvider } from '@/lib/payment/providers/Stripe'
@@ -73,9 +73,14 @@ export default function CheckoutPage() {
   const [phone, setPhone] = useState('')
   const [promoCode, setPromoCode] = useState('')
   const [transactionId, setTransactionId] = useState<string | null>(null)
+  const [gatewayTransactionId, setGatewayTransactionId] = useState<string | null>(null)
   const [ussdCode, setUssdCode] = useState<string | null>(null)
   const [processing, setProcessing] = useState(false)
   const [pollingCount, setPollingCount] = useState(0)
+  const [paymentStartedAt, setPaymentStartedAt] = useState<number | null>(null)
+
+  const POLLING_INTERVAL_MS = 5000
+  const POLLING_TIMEOUT_MS = 180000
 
   useEffect(() => {
     if (!user) { navigate('/login'); return }
@@ -100,25 +105,60 @@ export default function CheckoutPage() {
 
   // Poll payment status when waiting
   useEffect(() => {
-    if (step !== 'waiting' || !transactionId) return
+    if (step !== 'waiting' || !transactionId || !gatewayTransactionId || !paymentStartedAt) return
+
+    const syncTransactionStatus = async (nextStatus: 'success' | 'failed' | 'pending', payload?: unknown) => {
+      try {
+        await updateTransaction(transactionId, {
+          status: nextStatus,
+          webhook_received_at: new Date().toISOString(),
+          webhook_payload: payload && typeof payload === 'object' ? payload as Record<string, unknown> : null,
+        })
+      } catch {
+        // non-blocking sync failure
+      }
+    }
+
     const interval = setInterval(async () => {
+      const elapsed = Date.now() - paymentStartedAt
+      if (elapsed >= POLLING_TIMEOUT_MS) {
+        clearInterval(interval)
+        await syncTransactionStatus('failed', { reason: 'polling_timeout' })
+        toast.error('Délai dépassé. Vérifiez votre paiement puis réessayez.')
+        setStep('confirm')
+        return
+      }
+
       try {
         const provider = getPaymentProvider(methodData?.provider)
-        const status = await provider.checkPaymentStatus(transactionId)
+        const status = await provider.checkPaymentStatus(gatewayTransactionId)
+
         if (status.status === 'success') {
           clearInterval(interval)
+          await syncTransactionStatus('success', status.rawResponse)
           await refreshProfile()
           setStep('done')
-        } else if (status.status === 'failed') {
+          return
+        }
+
+        if (status.status === 'failed' || status.status === 'refunded') {
           clearInterval(interval)
+          await syncTransactionStatus('failed', status.rawResponse)
           toast.error('Paiement échoué. Veuillez réessayer.')
           setStep('confirm')
+          return
         }
-      } catch { /* ignore polling errors */ }
+
+        await syncTransactionStatus('pending', status.rawResponse)
+      } catch {
+        // retry on next tick
+      }
+
       setPollingCount(c => c + 1)
-    }, 5000)
+    }, POLLING_INTERVAL_MS)
+
     return () => clearInterval(interval)
-  }, [step, transactionId, methodData?.provider, refreshProfile])
+  }, [step, transactionId, gatewayTransactionId, methodData?.provider, refreshProfile, paymentStartedAt])
 
   function localPrice(yuan: number): string {
     const currency = countryData?.currency ?? 'XOF'
@@ -164,7 +204,10 @@ export default function CheckoutPage() {
         webhook_payload: null,
       })
 
-      setTransactionId(result.transactionId ?? tx.id)
+      setTransactionId(tx.id)
+      setGatewayTransactionId(result.transactionId ?? tx.id)
+      setPollingCount(0)
+      setPaymentStartedAt(Date.now())
       if (result.ussdCode) setUssdCode(result.ussdCode)
       if (result.paymentUrl) {
         window.open(result.paymentUrl, '_blank', 'noopener,noreferrer')
@@ -290,7 +333,16 @@ export default function CheckoutPage() {
                   <div className="h-1.5 w-1.5 rounded-full bg-yellow-500 animate-pulse" />
                   Vérification en cours{pollingCount > 0 ? ` (${pollingCount})` : '…'}
                 </div>
-                <Button variant="outline" size="sm" className="rounded-full" onClick={() => setStep('confirm')}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="rounded-full"
+                  onClick={() => {
+                    setPaymentStartedAt(null)
+                    setPollingCount(0)
+                    setStep('confirm')
+                  }}
+                >
                   Annuler / Réessayer
                 </Button>
               </div>
